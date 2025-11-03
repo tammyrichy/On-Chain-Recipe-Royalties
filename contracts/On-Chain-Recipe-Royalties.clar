@@ -14,16 +14,22 @@
 (define-constant err-already-rated (err u109))
 (define-constant err-fork-not-allowed (err u110))
 (define-constant err-invalid-percentage (err u111))
+(define-constant err-subscription-not-found (err u112))
+(define-constant err-subscription-expired (err u113))
+(define-constant err-subscription-active (err u114))
 
 (define-constant platform-fee-percentage u5)
 (define-constant max-royalty-percentage u50)
 (define-constant min-license-fee u1000000)
 (define-constant collaboration-bonus u10)
+(define-constant blocks-per-month u4320)
+(define-constant subscription-discount-percentage u30)
 
 (define-data-var recipe-id-nonce uint u1)
 (define-data-var license-id-nonce uint u1)
 (define-data-var fork-id-nonce uint u1)
 (define-data-var total-platform-earnings uint u0)
+(define-data-var subscription-id-nonce uint u1)
 
 (define-map recipes uint {
     chef: principal,
@@ -93,6 +99,22 @@
     recipe-id: uint,
     collaborators: (list 10 principal),
     revenue-shares: (list 10 uint)
+})
+
+(define-map recipe-subscriptions uint {
+    subscription-id: uint,
+    recipe-id: uint,
+    subscriber: principal,
+    start-block: uint,
+    expiry-block: uint,
+    monthly-fee: uint,
+    auto-renew: bool,
+    total-months-paid: uint
+})
+
+(define-map user-subscriptions { user: principal, recipe-id: uint } {
+    subscription-id: uint,
+    active: bool
 })
 
 (define-public (mint-recipe
@@ -333,6 +355,101 @@
 
 (define-read-only (get-recipe-rating (recipe-id uint) (rater principal))
   (map-get? recipe-ratings { recipe-id: recipe-id, rater: rater }))
+
+(define-public (subscribe-to-recipe (recipe-id uint) (auto-renew bool))
+  (let (
+    (recipe (unwrap! (map-get? recipes recipe-id) err-recipe-not-found))
+    (subscription-id (var-get subscription-id-nonce))
+    (license-fee (get license-fee recipe))
+    (monthly-fee (- license-fee (/ (* license-fee subscription-discount-percentage) u100)))
+    (platform-fee (/ (* monthly-fee platform-fee-percentage) u100))
+    (chef-earning (- monthly-fee platform-fee))
+    (expiry-block (+ stacks-block-height blocks-per-month)))
+    
+    (asserts! (is-none (map-get? user-subscriptions { user: tx-sender, recipe-id: recipe-id })) err-subscription-active)
+    
+    (try! (stx-transfer? monthly-fee tx-sender (as-contract tx-sender)))
+    (try! (as-contract (stx-transfer? chef-earning tx-sender (get chef recipe))))
+    
+    (map-set recipe-subscriptions subscription-id {
+        subscription-id: subscription-id,
+        recipe-id: recipe-id,
+        subscriber: tx-sender,
+        start-block: stacks-block-height,
+        expiry-block: expiry-block,
+        monthly-fee: monthly-fee,
+        auto-renew: auto-renew,
+        total-months-paid: u1
+    })
+    
+    (map-set user-subscriptions 
+        { user: tx-sender, recipe-id: recipe-id }
+        { subscription-id: subscription-id, active: true })
+    
+    (map-set recipes recipe-id
+        (merge recipe { total-earnings: (+ (get total-earnings recipe) chef-earning) }))
+    
+    (update-chef-profile (get chef recipe) chef-earning)
+    (var-set total-platform-earnings (+ (var-get total-platform-earnings) platform-fee))
+    (var-set subscription-id-nonce (+ subscription-id u1))
+    (ok subscription-id)))
+
+(define-public (renew-subscription (recipe-id uint))
+  (let (
+    (user-sub (unwrap! (map-get? user-subscriptions { user: tx-sender, recipe-id: recipe-id }) err-subscription-not-found))
+    (subscription-id (get subscription-id user-sub))
+    (subscription (unwrap! (map-get? recipe-subscriptions subscription-id) err-subscription-not-found))
+    (recipe (unwrap! (map-get? recipes recipe-id) err-recipe-not-found))
+    (monthly-fee (get monthly-fee subscription))
+    (platform-fee (/ (* monthly-fee platform-fee-percentage) u100))
+    (chef-earning (- monthly-fee platform-fee))
+    (new-expiry (+ (get expiry-block subscription) blocks-per-month)))
+    
+    (asserts! (get active user-sub) err-subscription-not-found)
+    
+    (try! (stx-transfer? monthly-fee tx-sender (as-contract tx-sender)))
+    (try! (as-contract (stx-transfer? chef-earning tx-sender (get chef recipe))))
+    
+    (map-set recipe-subscriptions subscription-id
+        (merge subscription { 
+            expiry-block: new-expiry,
+            total-months-paid: (+ (get total-months-paid subscription) u1)
+        }))
+    
+    (map-set recipes recipe-id
+        (merge recipe { total-earnings: (+ (get total-earnings recipe) chef-earning) }))
+    
+    (update-chef-profile (get chef recipe) chef-earning)
+    (var-set total-platform-earnings (+ (var-get total-platform-earnings) platform-fee))
+    (ok new-expiry)))
+
+(define-public (cancel-subscription (recipe-id uint))
+  (let (
+    (user-sub (unwrap! (map-get? user-subscriptions { user: tx-sender, recipe-id: recipe-id }) err-subscription-not-found))
+    (subscription-id (get subscription-id user-sub))
+    (subscription (unwrap! (map-get? recipe-subscriptions subscription-id) err-subscription-not-found)))
+    
+    (asserts! (get active user-sub) err-subscription-not-found)
+    
+    (map-set recipe-subscriptions subscription-id
+        (merge subscription { auto-renew: false }))
+    
+    (map-set user-subscriptions 
+        { user: tx-sender, recipe-id: recipe-id }
+        { subscription-id: subscription-id, active: false })
+    (ok true)))
+
+(define-read-only (get-subscription (user principal) (recipe-id uint))
+  (match (map-get? user-subscriptions { user: user, recipe-id: recipe-id })
+    user-sub (map-get? recipe-subscriptions (get subscription-id user-sub))
+    none))
+
+(define-read-only (is-subscription-valid (user principal) (recipe-id uint))
+  (match (get-subscription user recipe-id)
+    subscription (ok (and 
+        (>= (get expiry-block subscription) stacks-block-height)
+        (is-some (map-get? user-subscriptions { user: user, recipe-id: recipe-id }))))
+    (ok false)))
 
 ;; title: On-Chain-Recipe-Royalties
 ;; version:
